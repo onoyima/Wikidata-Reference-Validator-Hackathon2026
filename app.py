@@ -1089,8 +1089,97 @@ def extract_text_from_html(html):
         return ""
 
 
+# ---------------------------------------------------
+# EMBEDDING-BASED SEMANTIC MATCHING (Phase 3)
+# ---------------------------------------------------
+
+# Global embedding model (loaded lazily)
+_embedding_model = None
+
+
+def get_embedding_model():
+    """Load sentence-transformers model for semantic similarity."""
+    global _embedding_model
+    if _embedding_model is None:
+        try:
+            from sentence_transformers import SentenceTransformer
+            model_name = os.environ.get("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
+            _embedding_model = SentenceTransformer(model_name)
+        except ImportError:
+            print("[Embeddings] sentence-transformers not installed, using keyword scoring only")
+            _embedding_model = False
+        except Exception as e:
+            print(f"[Embeddings] Failed to load model: {e}")
+            _embedding_model = False
+    return _embedding_model
+
+
+def build_claim_text(claim_ctx):
+    """Build a natural language representation of the claim for embedding."""
+    parts = []
+    item_label = claim_ctx.get("item_label", "")
+    prop_label = claim_ctx.get("property_label", "")
+    value_label = claim_ctx.get("statement_value_label", "")
+    
+    if item_label and prop_label and value_label:
+        parts.append(f"{item_label} {prop_label} {value_label}")
+    if prop_label and value_label:
+        parts.append(f"{prop_label}: {value_label}")
+    if item_label and prop_label:
+        parts.append(f"{item_label} has {prop_label} {value_label}")
+    
+    return " ".join(parts) if parts else ""
+
+
+def get_claim_embedding(claim_ctx):
+    """Get embedding for the claim."""
+    model = get_embedding_model()
+    if not model:
+        return None
+    try:
+        claim_text = build_claim_text(claim_ctx)
+        if not claim_text:
+            return None
+        return model.encode(claim_text, normalize_embeddings=True)
+    except Exception as e:
+        print(f"[Embeddings] Claim encoding failed: {e}")
+        return None
+
+
+def get_text_embedding(text, max_length=512):
+    """Get embedding for a text chunk."""
+    model = get_embedding_model()
+    if not model:
+        return None
+    try:
+        # Truncate to model max length
+        truncated = text[:max_length * 4]  # rough char estimate
+        return model.encode(truncated, normalize_embeddings=True)
+    except Exception as e:
+        print(f"[Embeddings] Text encoding failed: {e}")
+        return None
+
+
+def semantic_similarity(claim_ctx, text):
+    """Compute semantic similarity between claim and text."""
+    claim_emb = get_claim_embedding(claim_ctx)
+    if claim_emb is None:
+        return 0.0
+    
+    text_emb = get_text_embedding(text)
+    if text_emb is None:
+        return 0.0
+    
+    try:
+        import numpy as np
+        # Cosine similarity (embeddings are normalized)
+        return float(np.dot(claim_emb, text_emb))
+    except Exception:
+        return 0.0
+
+
 def score_candidate_relevance(text, claim_ctx):
-    """Score how well a page matches the claim."""
+    """Score how well a page matches the claim (keyword + semantic)."""
     import re
     text_lower = text.lower()
     
@@ -1098,15 +1187,16 @@ def score_candidate_relevance(text, claim_ctx):
     prop_label = claim_ctx.get("property_label", "").lower()
     value_label = claim_ctx.get("statement_value_label", "").lower()
     
-    score = 0.0
+    # Keyword-based score (original)
+    kw_score = 0.0
     weights = {"item": 0.4, "property": 0.3, "value": 0.3}
     
     if item_label and item_label in text_lower:
-        score += weights["item"]
+        kw_score += weights["item"]
     if prop_label and prop_label in text_lower:
-        score += weights["property"]
+        kw_score += weights["property"]
     if value_label and value_label in text_lower:
-        score += weights["value"]
+        kw_score += weights["value"]
     
     # Bonus for proximity
     if item_label and value_label:
@@ -1115,45 +1205,76 @@ def score_candidate_relevance(text, claim_ctx):
         if item_pos >= 0 and value_pos >= 0:
             distance = abs(item_pos - value_pos)
             if distance < 200:
-                score += 0.1
+                kw_score += 0.1
             elif distance < 500:
-                score += 0.05
+                kw_score += 0.05
     
-    return min(score, 1.0)
+    # Semantic similarity score (new)
+    sem_score = semantic_similarity(claim_ctx, text)
+    
+    # Combined score: 60% semantic, 40% keyword
+    combined = 0.6 * sem_score + 0.4 * kw_score
+    
+    return min(combined, 1.0)
 
 
 def find_best_fragment(text, claim_ctx):
-    """Find the best text fragment for deep linking."""
+    """Find the best text fragment for deep linking (semantic-aware)."""
     import re
     text_lower = text.lower()
     
     item_label = claim_ctx.get("item_label", "").lower()
     value_label = claim_ctx.get("statement_value_label", "").lower()
+    prop_label = claim_ctx.get("property_label", "").lower()
     
-    # Find position of key terms
+    # Strategy 1: Semantic sliding window (if embeddings available)
+    model = get_embedding_model()
+    if model:
+        claim_emb = get_claim_embedding(claim_ctx)
+        if claim_emb is not None:
+            try:
+                import numpy as np
+                # Slide window over text, find best matching segment
+                window_size = 300
+                stride = 100
+                best_score = -1
+                best_start = 0
+                
+                for start in range(0, max(1, len(text) - window_size), stride):
+                    chunk = text[start:start + window_size]
+                    chunk_emb = get_text_embedding(chunk)
+                    if chunk_emb is not None:
+                        score = float(np.dot(claim_emb, chunk_emb))
+                        if score > best_score:
+                            best_score = score
+                            best_start = start
+                
+                if best_score > 0.3:  # Threshold for semantic match
+                    end = min(len(text), best_start + 300)
+                    fragment = text[best_start:end].strip()
+                    fragment = re.sub(r'\s+', ' ', fragment)
+                    return fragment[:300]
+            except Exception:
+                pass  # Fall back to keyword method
+    
+    # Strategy 2: Keyword-based (fallback)
     positions = []
-    if item_label:
-        pos = text_lower.find(item_label)
-        if pos >= 0:
-            positions.append(pos)
-    if value_label:
-        pos = text_lower.find(value_label)
-        if pos >= 0:
-            positions.append(pos)
+    for term in [item_label, value_label, prop_label]:
+        if term:
+            pos = text_lower.find(term)
+            if pos >= 0:
+                positions.append(pos)
     
     if not positions:
         return ""
     
-    # Center fragment around middle of matches
     center = sum(positions) // len(positions)
     start = max(0, center - 150)
     end = min(len(text), center + 150)
     fragment = text[start:end].strip()
     
-    # Clean for URL fragment
     fragment = re.sub(r'\s+', ' ', fragment)
-    fragment = fragment[:300]  # URL fragment limit
-    return fragment
+    return fragment[:300]
 
 
 def highlight_snippet(text, claim_ctx, fragment):

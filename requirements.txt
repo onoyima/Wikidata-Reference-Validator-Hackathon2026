@@ -2,3 +2,4 @@ Flask
 requests
 aiohttp
 python-dotenv
+sentence-transformers
