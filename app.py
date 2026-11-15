@@ -780,163 +780,194 @@ async def find_candidates_from_wikidata_sparql(session, claim_ctx, max_results=1
 # SEARCH API INTEGRATION
 # ---------------------------------------------------
 
-SERPAPI_KEY = os.environ.get("SERPAPI_KEY", "")
-BING_API_KEY = os.environ.get("BING_API_KEY", "")
+# ---------------------------------------------------
+# WIKIDATA-BASED CANDIDATE DISCOVERY (NO EXTERNAL APIs)
+# ---------------------------------------------------
 
-
-async def find_candidates_from_search_api(session, semaphore, claim_ctx, max_results=10):
-    """Find candidate URLs using search APIs (SerpAPI, Bing, or fallback)."""
+async def find_candidates_from_wikidata_search(session, claim_ctx, max_results=10):
+    """Find candidates using Wikidata's own search and entity data."""
     candidates = []
     
-    # Build search queries
-    queries = build_search_queries(claim_ctx)
+    item_label = claim_ctx.get("item_label", "")
+    property_id = claim_ctx.get("property_id", "")
+    statement_value = claim_ctx.get("statement_value", "")
+    statement_value_label = claim_ctx.get("statement_value_label", "")
+    prop_label = claim_ctx.get("property_label", "")
     
-    # Try SerpAPI first
-    if SERPAPI_KEY:
-        for query in queries[:3]:  # Limit queries to avoid quota
-            serpapi_results = await search_serpapi(session, query, max_results=5)
-            candidates.extend(serpapi_results)
-            if len(candidates) >= max_results:
-                break
+    if not item_label or not property_id:
+        return candidates
     
-    # Try Bing API if SerpAPI not available or insufficient results
-    if BING_API_KEY and len(candidates) < max_results:
-        for query in queries[:3]:
-            bing_results = await search_bing(session, query, max_results=5)
-            candidates.extend(bing_results)
-            if len(candidates) >= max_results:
-                break
-    
-    # Fallback: DuckDuckGo HTML scraping (no API key needed)
-    if len(candidates) < max_results:
-        for query in queries[:2]:
-            ddg_results = await search_duckduckgo_html(session, semaphore, query, max_results=5)
-            candidates.extend(ddg_results)
-            if len(candidates) >= max_results:
-                break
-    
-    # Add metadata
-    for cand in candidates:
-        cand["source"] = "search_api"
-    
-    return candidates[:max_results]
-
-
-async def search_serpapi(session, query, max_results=5):
-    """Search using SerpAPI."""
+    # Strategy 1: Search for items with similar labels that have this property
+    search_query = f'"{item_label}"'
     try:
         params = {
-            "q": query,
-            "api_key": SERPAPI_KEY,
-            "num": max_results,
-            "engine": "google"
+            "action": "wbsearchentities",
+            "search": item_label,
+            "language": "en",
+            "format": "json",
+            "limit": 10
         }
-        async with session.get("https://serpapi.com/search", params=params, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-            if resp.status != 200:
-                return []
-            data = await resp.json()
-            results = data.get("organic_results", [])
-            
-            candidates = []
-            for r in results[:max_results]:
-                url = r.get("link", "")
-                title = r.get("title", "")
-                snippet = r.get("snippet", "")
-                if url and url.startswith("http"):
-                    candidates.append({
-                        "url": url,
-                        "title": title,
-                        "snippet": snippet,
-                        "source": "serpapi"
-                    })
-            return candidates
+        async with session.get(WIKIDATA_API, params=params, headers=EXTERNAL_HEADERS, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                for item in data.get("search", [])[:5]:
+                    similar_qid = item.get("id")
+                    if similar_qid and similar_qid != claim_ctx.get("qid"):
+                        # Get references from this similar item for the same property
+                        similar_candidates = await get_references_for_property(session, similar_qid, property_id)
+                        candidates.extend(similar_candidates)
     except Exception as e:
-        print(f"[SerpAPI] Failed: {e}")
-        return []
-
-
-async def search_bing(session, query, max_results=5):
-    """Search using Bing Web Search API."""
-    try:
-        headers = {"Ocp-Apim-Subscription-Key": BING_API_KEY}
-        params = {"q": query, "count": max_results, "responseFilter": "Webpages"}
-        async with session.get("https://api.bing.microsoft.com/v7.0/search", params=params, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-            if resp.status != 200:
-                return []
-            data = await resp.json()
-            results = data.get("webPages", {}).get("value", [])
-            
-            candidates = []
-            for r in results[:max_results]:
-                url = r.get("url", "")
-                title = r.get("name", "")
-                snippet = r.get("snippet", "")
-                if url and url.startswith("http"):
-                    candidates.append({
-                        "url": url,
-                        "title": title,
-                        "snippet": snippet,
-                        "source": "bing"
-                    })
-            return candidates
-    except Exception as e:
-        print(f"[Bing] Failed: {e}")
-        return []
-
-
-async def search_duckduckgo_html(session, semaphore, query, max_results=5):
-    """Fallback: scrape DuckDuckGo HTML (no API key needed)."""
-    async with semaphore:
+        print(f"[Wikidata Search] Failed: {e}")
+    
+    # Strategy 2: Use the statement value entity's references if it's an entity
+    if statement_value and statement_value.startswith("Q"):
         try:
-            params = {"q": query, "kl": "us-en"}
-            headers = {**EXTERNAL_HEADERS, "Accept": "text/html"}
-            async with session.get("https://html.duckduckgo.com/html/", params=params, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                if resp.status != 200:
-                    return []
-                html = await resp.text()
-                
-                # Parse results from HTML
-                import re
-                candidates = []
-                # DuckDuckGo result links
-                result_pattern = r'class="result__snippet".*?href="(https?://[^"]+)"[^>]*>([^<]+)</a>'
-                matches = re.findall(result_pattern, html, re.DOTALL)
-                
-                for url, title in matches[:max_results]:
-                    if url.startswith("http"):
-                        candidates.append({
-                            "url": url,
-                            "title": title.strip(),
-                            "source": "duckduckgo"
-                        })
-                return candidates
+            value_candidates = await get_references_for_property(session, statement_value, property_id)
+            candidates.extend(value_candidates)
         except Exception as e:
-            print(f"[DuckDuckGo] Failed: {e}")
-            return []
-
-
-def build_search_queries(claim_ctx):
-    """Build multiple search query strategies from claim context."""
-    queries = []
+            print(f"[Value Entity Refs] Failed: {e}")
     
-    item_label = claim_ctx.get("item_label", "")
-    prop_label = claim_ctx.get("property_label", "")
-    value_label = claim_ctx.get("statement_value_label", "")
+    # Strategy 3: Wikidata property "example" references (P1855/P1856)
+    try:
+        prop_examples = await get_property_example_references(session, property_id)
+        candidates.extend(prop_examples)
+    except Exception as e:
+        print(f"[Property Examples] Failed: {e}")
+    
+    # Deduplicate
+    seen = set()
+    unique = []
+    for c in candidates:
+        if c["url"] not in seen:
+            seen.add(c["url"])
+            unique.append(c)
+    
+    return unique[:max_results]
+
+
+async def get_references_for_property(session, qid, property_id):
+    """Extract reference URLs from a specific entity's claims for a property."""
+    try:
+        params = {"action": "wbgetentities", "ids": qid, "format": "json", "props": "claims"}
+        async with session.get(WIKIDATA_API, params=params, headers=EXTERNAL_HEADERS, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            if resp.status != 200:
+                return []
+            data = await resp.json()
+            entity = data.get("entities", {}).get(qid, {})
+            claims = entity.get("claims", {}).get(property_id, [])
+            
+            candidates = []
+            for claim in claims:
+                for ref in claim.get("references", []):
+                    for snaks in ref.get("snaks", {}).values():
+                        for snak in snaks:
+                            dv = snak.get("datavalue", {}).get("value")
+                            if isinstance(dv, dict) and "uri" in dv:
+                                url = dv["uri"]
+                                if url.startswith("http"):
+                                    # Get title from reference if available (P1476)
+                                    title = ""
+                                    if "P1476" in ref.get("snaks", {}):
+                                        title_snak = ref["snaks"]["P1476"][0]
+                                        title = title_snak.get("datavalue", {}).get("value", "")
+                                    
+                                    candidates.append({
+                                        "url": url,
+                                        "title": title,
+                                        "source_item": qid,
+                                        "source": "wikidata_entity_refs",
+                                        "property_id": property_id
+                                    })
+            return candidates
+    except Exception:
+        return []
+
+
+async def get_property_example_references(session, property_id):
+    """Get example references from property constraints (P1855/P1856)."""
+    try:
+        params = {"action": "wbgetentities", "ids": property_id, "format": "json", "props": "claims"}
+        async with session.get(WIKIDATA_API, params=params, headers=EXTERNAL_HEADERS, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            if resp.status != 200:
+                return []
+            data = await resp.json()
+            entity = data.get("entities", {}).get(property_id, {})
+            claims = entity.get("claims", {})
+            
+            candidates = []
+            # P1855 = example of reference (example reference URL)
+            for claim in claims.get("P1855", []):
+                mainsnak = claim.get("mainsnak", {})
+                dv = mainsnak.get("datavalue", {}).get("value")
+                if isinstance(dv, str) and dv.startswith("http"):
+                    candidates.append({
+                        "url": dv,
+                        "title": f"Example reference for {property_id}",
+                        "source": "wikidata_property_example",
+                        "property_id": property_id
+                    })
+            return candidates
+    except Exception:
+        return []
+
+
+async def find_candidates_from_curated_domains_direct(session, semaphore, claim_ctx, max_results=10):
+    """Direct fetch from curated domains using known URL patterns."""
     property_id = claim_ctx.get("property_id", "")
+    domains = PROPERTY_AUTHORITY_DOMAINS.get(property_id, [])
     
-    # Strategy 1: Entity + property (most specific)
-    if item_label and prop_label:
-        queries.append(f'"{item_label}" "{prop_label}"')
+    if not domains:
+        return []
     
-    # Strategy 2: Value + property (for entity values)
-    if value_label and prop_label:
-        queries.append(f'"{value_label}" "{prop_label}"')
+    candidates = []
+    item_label = claim_ctx.get("item_label", "")
+    statement_value_label = claim_ctx.get("statement_value_label", "")
     
-    # Strategy 3: Natural language
-    if item_label and value_label:
-        queries.append(f"{item_label} {prop_label} {value_label}")
+    # Known URL patterns for common domains
+    domain_patterns = {
+        "cia.gov": lambda item, val: f"https://www.cia.gov/the-world-factbook/countries/{item.lower().replace(' ', '-')}/",
+        "state.gov": lambda item, val: f"https://www.state.gov/countries-areas/{item.lower().replace(' ', '-')}/",
+        "un.org": lambda item, val: f"https://www.un.org/en/about-us/member-states/{item.lower().replace(' ', '-')}",
+        "britannica.com": lambda item, val: f"https://www.britannica.com/place/{item}",
+        "geonames.org": lambda item, val: f"https://www.geonames.org/search.html?q={item}",
+        "openstreetmap.org": lambda item, val: f"https://nominatim.openstreetmap.org/search?q={item}&format=json",
+        "viaf.org": lambda item, val: f"https://viaf.org/viaf/search?query={item}",
+        "worldcat.org": lambda item, val: f"https://www.worldcat.org/search?q={item}",
+        "id.loc.gov": lambda item, val: f"https://id.loc.gov/authorities/names/{item}",
+        "wikidata.org": lambda item, val: f"https://www.wikidata.org/wiki/Special:EntityData/{item}.json",
+        "wikipedia.org": lambda item, val: f"https://en.wikipedia.org/wiki/{item.replace(' ', '_')}",
+    }
     
-    # Strategy 4: Property-specific patterns
+    # Try pattern-based URLs for top domains
+    for domain in domains[:5]:
+        if domain in domain_patterns and item_label:
+            try:
+                url = domain_patterns[domain](item_label, statement_value_label)
+                # Verify the URL exists
+                async with semaphore:
+                    async with session.head(url, headers=EXTERNAL_HEADERS, timeout=aiohttp.ClientTimeout(total=5), allow_redirects=True) as resp:
+                        if resp.status < 400:
+                            candidates.append({
+                                "url": str(resp.url),
+                                "title": f"{domain} page for {item_label}",
+                                "source": "curated_domain_pattern",
+                                "property_id": property_id,
+                                "domain": domain
+                            })
+            except Exception:
+                pass
+    
+    return candidates
+
+
+async def find_candidates_from_curated_domains(session, semaphore, claim_ctx, max_results=10):
+    """Wrapper for curated domain discovery."""
+    return await find_candidates_from_curated_domains_direct(session, semaphore, claim_ctx, max_results)
+
+
+# ---------------------------------------------------
+# VERIFICATION
+# ---------------------------------------------------
     property_patterns = {
         "P31": ["instance of", "type of", "classification"],
         "P17": ["country", "nation", "state"],
@@ -1485,11 +1516,11 @@ def find_replacement_candidates():
                 sparql_candidates = await find_candidates_from_wikidata_sparql(session, claim_ctx, max_results=15)
                 all_candidates.extend(sparql_candidates)
                 
-                # 2. Search API fallback (SerpAPI, Bing, or DuckDuckGo HTML)
-                search_candidates = await find_candidates_from_search_api(session, semaphore, claim_ctx, max_results=15)
-                all_candidates.extend(search_candidates)
+                # 2. Wikidata entity search & cross-references (NO external APIs)
+                wikidata_candidates = await find_candidates_from_wikidata_search(session, claim_ctx, max_results=15)
+                all_candidates.extend(wikidata_candidates)
                 
-                # 3. Curated domain direct fetch (for high-priority properties)
+                # 3. Curated domain direct fetch (pattern-based URLs)
                 domain_candidates = await find_candidates_from_curated_domains(session, semaphore, claim_ctx, max_results=10)
                 all_candidates.extend(domain_candidates)
                 
