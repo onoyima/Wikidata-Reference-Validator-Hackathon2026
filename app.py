@@ -50,6 +50,47 @@ EXTERNAL_HEADERS = {
 
 
 # ---------------------------------------------------
+# CANDIDATE CACHE
+# ---------------------------------------------------
+
+class CandidateCache:
+    """Simple in-memory cache with TTL for verified candidates."""
+    
+    def __init__(self, ttl_seconds=3600):
+        self.cache = {}
+        self.ttl = ttl_seconds
+    
+    def _make_key(self, claim_ctx):
+        key_parts = [
+            claim_ctx.get("qid", ""),
+            claim_ctx.get("property_id", ""),
+            claim_ctx.get("statement_value", "")
+        ]
+        return "|".join(key_parts)
+    
+    def get(self, claim_ctx):
+        key = self._make_key(claim_ctx)
+        if key in self.cache:
+            entry = self.cache[key]
+            if time.time() - entry["timestamp"] < self.ttl:
+                return entry["candidates"]
+            else:
+                del self.cache[key]
+        return None
+    
+    def set(self, claim_ctx, candidates):
+        key = self._make_key(claim_ctx)
+        self.cache[key] = {
+            "candidates": candidates,
+            "timestamp": time.time()
+        }
+
+
+# Global cache instance
+candidate_cache = CandidateCache(ttl_seconds=3600)
+
+
+# ---------------------------------------------------
 # LANGUAGES
 # ---------------------------------------------------
 # Languages offered in the UI. The template renders this list, so adding a
@@ -735,6 +776,233 @@ async def find_candidates_from_wikidata_sparql(session, claim_ctx, max_results=1
         return []
 
 
+# ---------------------------------------------------
+# SEARCH API INTEGRATION
+# ---------------------------------------------------
+
+SERPAPI_KEY = os.environ.get("SERPAPI_KEY", "")
+BING_API_KEY = os.environ.get("BING_API_KEY", "")
+
+
+async def find_candidates_from_search_api(session, semaphore, claim_ctx, max_results=10):
+    """Find candidate URLs using search APIs (SerpAPI, Bing, or fallback)."""
+    candidates = []
+    
+    # Build search queries
+    queries = build_search_queries(claim_ctx)
+    
+    # Try SerpAPI first
+    if SERPAPI_KEY:
+        for query in queries[:3]:  # Limit queries to avoid quota
+            serpapi_results = await search_serpapi(session, query, max_results=5)
+            candidates.extend(serpapi_results)
+            if len(candidates) >= max_results:
+                break
+    
+    # Try Bing API if SerpAPI not available or insufficient results
+    if BING_API_KEY and len(candidates) < max_results:
+        for query in queries[:3]:
+            bing_results = await search_bing(session, query, max_results=5)
+            candidates.extend(bing_results)
+            if len(candidates) >= max_results:
+                break
+    
+    # Fallback: DuckDuckGo HTML scraping (no API key needed)
+    if len(candidates) < max_results:
+        for query in queries[:2]:
+            ddg_results = await search_duckduckgo_html(session, semaphore, query, max_results=5)
+            candidates.extend(ddg_results)
+            if len(candidates) >= max_results:
+                break
+    
+    # Add metadata
+    for cand in candidates:
+        cand["source"] = "search_api"
+    
+    return candidates[:max_results]
+
+
+async def search_serpapi(session, query, max_results=5):
+    """Search using SerpAPI."""
+    try:
+        params = {
+            "q": query,
+            "api_key": SERPAPI_KEY,
+            "num": max_results,
+            "engine": "google"
+        }
+        async with session.get("https://serpapi.com/search", params=params, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+            if resp.status != 200:
+                return []
+            data = await resp.json()
+            results = data.get("organic_results", [])
+            
+            candidates = []
+            for r in results[:max_results]:
+                url = r.get("link", "")
+                title = r.get("title", "")
+                snippet = r.get("snippet", "")
+                if url and url.startswith("http"):
+                    candidates.append({
+                        "url": url,
+                        "title": title,
+                        "snippet": snippet,
+                        "source": "serpapi"
+                    })
+            return candidates
+    except Exception as e:
+        print(f"[SerpAPI] Failed: {e}")
+        return []
+
+
+async def search_bing(session, query, max_results=5):
+    """Search using Bing Web Search API."""
+    try:
+        headers = {"Ocp-Apim-Subscription-Key": BING_API_KEY}
+        params = {"q": query, "count": max_results, "responseFilter": "Webpages"}
+        async with session.get("https://api.bing.microsoft.com/v7.0/search", params=params, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+            if resp.status != 200:
+                return []
+            data = await resp.json()
+            results = data.get("webPages", {}).get("value", [])
+            
+            candidates = []
+            for r in results[:max_results]:
+                url = r.get("url", "")
+                title = r.get("name", "")
+                snippet = r.get("snippet", "")
+                if url and url.startswith("http"):
+                    candidates.append({
+                        "url": url,
+                        "title": title,
+                        "snippet": snippet,
+                        "source": "bing"
+                    })
+            return candidates
+    except Exception as e:
+        print(f"[Bing] Failed: {e}")
+        return []
+
+
+async def search_duckduckgo_html(session, semaphore, query, max_results=5):
+    """Fallback: scrape DuckDuckGo HTML (no API key needed)."""
+    async with semaphore:
+        try:
+            params = {"q": query, "kl": "us-en"}
+            headers = {**EXTERNAL_HEADERS, "Accept": "text/html"}
+            async with session.get("https://html.duckduckgo.com/html/", params=params, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                if resp.status != 200:
+                    return []
+                html = await resp.text()
+                
+                # Parse results from HTML
+                import re
+                candidates = []
+                # DuckDuckGo result links
+                result_pattern = r'class="result__snippet".*?href="(https?://[^"]+)"[^>]*>([^<]+)</a>'
+                matches = re.findall(result_pattern, html, re.DOTALL)
+                
+                for url, title in matches[:max_results]:
+                    if url.startswith("http"):
+                        candidates.append({
+                            "url": url,
+                            "title": title.strip(),
+                            "source": "duckduckgo"
+                        })
+                return candidates
+        except Exception as e:
+            print(f"[DuckDuckGo] Failed: {e}")
+            return []
+
+
+def build_search_queries(claim_ctx):
+    """Build multiple search query strategies from claim context."""
+    queries = []
+    
+    item_label = claim_ctx.get("item_label", "")
+    prop_label = claim_ctx.get("property_label", "")
+    value_label = claim_ctx.get("statement_value_label", "")
+    property_id = claim_ctx.get("property_id", "")
+    
+    # Strategy 1: Entity + property (most specific)
+    if item_label and prop_label:
+        queries.append(f'"{item_label}" "{prop_label}"')
+    
+    # Strategy 2: Value + property (for entity values)
+    if value_label and prop_label:
+        queries.append(f'"{value_label}" "{prop_label}"')
+    
+    # Strategy 3: Natural language
+    if item_label and value_label:
+        queries.append(f"{item_label} {prop_label} {value_label}")
+    
+    # Strategy 4: Property-specific patterns
+    property_patterns = {
+        "P31": ["instance of", "type of", "classification"],
+        "P17": ["country", "nation", "state"],
+        "P106": ["occupation", "profession", "job"],
+        "P571": ["founded", "established", "inception"],
+        "P625": ["coordinates", "latitude", "longitude"],
+        "P1082": ["population", "inhabitants"],
+        "P30": ["located in", "located at"],
+        "P131": ["located in", "administrative unit"],
+        "P27": ["citizen of", "nationality"],
+        "P495": ["origin", "country of origin"],
+        "P407": ["language", "written in"],
+        "P361": ["part of", "subclass of"],
+    }
+    
+    if property_id in property_patterns:
+        for pattern in property_patterns[property_id]:
+            if item_label:
+                queries.append(f'"{item_label}" "{pattern}"')
+            if value_label:
+                queries.append(f'"{value_label}" "{pattern}"')
+    
+    # Strategy 5: Wikidata property constraints
+    if property_id and value_label and value_label.startswith("Q"):
+        queries.append(f'wikidata {property_id} {value_label}')
+    
+    # Remove duplicates while preserving order
+    seen = set()
+    unique_queries = []
+    for q in queries:
+        if q not in seen:
+            seen.add(q)
+            unique_queries.append(q)
+    
+    return unique_queries[:6]  # Limit total queries
+
+
+# ---------------------------------------------------
+# CURATED DOMAIN DIRECT FETCH
+# ---------------------------------------------------
+
+async def find_candidates_from_curated_domains(session, semaphore, claim_ctx, max_results=10):
+    """Direct fetch from high-authority curated domains for specific properties."""
+    property_id = claim_ctx.get("property_id", "")
+    domains = PROPERTY_AUTHORITY_DOMAINS.get(property_id, [])
+    
+    if not domains:
+        return []
+    
+    # Build queries
+    queries = build_search_queries(claim_ctx)
+    if not queries:
+        return []
+    
+    candidates = []
+    # Try top 3 domains with top 2 queries
+    for domain in domains[:3]:
+        for query in queries[:2]:
+            search_url = f"https://www.google.com/search?q=site:{domain}+{quote(query)}&num=5"
+            # Note: This would need a search API or headless browser
+            # For now, skip direct Google scraping to avoid blocks
+            pass
+    
+    return candidates
+
+
 async def fetch_and_verify_candidate(session, semaphore, url, claim_ctx):
     """Fetch a candidate URL and verify it contains the claim information."""
     async with semaphore:
@@ -1203,24 +1471,53 @@ def find_replacement_candidates():
         
         # Run async candidate discovery
         async def run_discovery():
+            # Check cache first
+            cached = candidate_cache.get(claim_ctx)
+            if cached:
+                return cached
+            
             semaphore = asyncio.Semaphore(10)
             connector = aiohttp.TCPConnector(ssl=False, limit=20)
             async with aiohttp.ClientSession(headers=EXTERNAL_HEADERS, connector=connector) as session:
-                # Get candidates from Wikidata SPARQL (proven references)
-                sparql_candidates = await find_candidates_from_wikidata_sparql(session, claim_ctx, max_results=10)
+                all_candidates = []
+                
+                # 1. Wikidata SPARQL (proven references from similar items)
+                sparql_candidates = await find_candidates_from_wikidata_sparql(session, claim_ctx, max_results=15)
+                all_candidates.extend(sparql_candidates)
+                
+                # 2. Search API fallback (SerpAPI, Bing, or DuckDuckGo HTML)
+                search_candidates = await find_candidates_from_search_api(session, semaphore, claim_ctx, max_results=15)
+                all_candidates.extend(search_candidates)
+                
+                # 3. Curated domain direct fetch (for high-priority properties)
+                domain_candidates = await find_candidates_from_curated_domains(session, semaphore, claim_ctx, max_results=10)
+                all_candidates.extend(domain_candidates)
+                
+                # Deduplicate by URL
+                seen_urls = set()
+                unique_candidates = []
+                for cand in all_candidates:
+                    url = cand.get("url", "")
+                    if url and url not in seen_urls:
+                        seen_urls.add(url)
+                        unique_candidates.append(cand)
                 
                 # Verify each candidate
                 verified = []
-                for cand in sparql_candidates:
+                for cand in unique_candidates:
                     result = await fetch_and_verify_candidate(session, semaphore, cand["url"], claim_ctx)
                     if result:
                         result["title"] = cand.get("title", "")
-                        result["source"] = "wikidata_sparql"
+                        result["source"] = cand.get("source", "unknown")
                         verified.append(result)
                 
-                # Sort by score
+                # Sort by score (descending)
                 verified.sort(key=lambda x: x["score"], reverse=True)
-                return verified[:10]
+                result = verified[:10]
+                
+                # Cache the results
+                candidate_cache.set(claim_ctx, result)
+                return result
         
         candidates = asyncio.run(run_discovery())
         
