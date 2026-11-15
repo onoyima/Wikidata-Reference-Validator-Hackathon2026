@@ -1,10 +1,12 @@
 import base64
 import hashlib
+import json
 import os
 import re
 import secrets
-from datetime import timedelta
-from urllib.parse import urlencode, urlparse
+import time
+from datetime import datetime, timedelta
+from urllib.parse import urlencode, urlparse, quote
 
 from flask import Flask, jsonify, redirect, render_template, request, session, url_for
 import requests
@@ -488,6 +490,387 @@ async def fetch_wayback_snapshot_async(session, semaphore, url):
 
 
 # ---------------------------------------------------
+# REFERENCE REPLACEMENT CANDIDATE DISCOVERY
+# ---------------------------------------------------
+
+WIKIDATA_SPARQL = "https://query.wikidata.org/sparql"
+
+# Curated authority domains per property (high-trust sources for replacement candidates)
+PROPERTY_AUTHORITY_DOMAINS = {
+    "P31": ["wikidata.org", "wikipedia.org", "britannica.com", "academia.edu", "stanford.edu", "oxfordreference.com"],
+    "P17": ["un.org", "unmemberstates.un.org", "cia.gov", "state.gov", "gov.uk", "europa.eu", "foreignaffairs.gov.za"],
+    "P106": ["viaf.org", "worldcat.org", "id.loc.gov", "isni.org", "orcid.org", "wikidata.org", "wikipedia.org"],
+    "P571": ["loc.gov", "archive.org", "worldcat.org", "nationalarchives.gov.uk", "biodiversitylibrary.org"],
+    "P625": ["geonames.org", "openstreetmap.org", "nominatim.openstreetmap.org", "geodata.solutions"],
+    "P1082": ["census.gov", "worldbank.org", "citypopulation.de", "stat.gov.pl", "inegi.org.mx", "ibge.gov.br"],
+    "P30": ["geonames.org", "openstreetmap.org", "stat.gov.pl", "citypopulation.de"],
+    "P131": ["geonames.org", "openstreetmap.org", "citypopulation.de", "stat.gov.pl"],
+    "P27": ["viaf.org", "worldcat.org", "id.loc.gov", "orcid.org", "isni.org"],
+    "P495": ["musicbrainz.org", "discogs.com", "last.fm", "allmusic.com"],
+    "P407": ["ethnologue.com", "glottolog.org", "wals.info", "omniglot.com"],
+    "P361": ["wikidata.org", "wikipedia.org", "britannica.com"],
+    "P364": ["wikidata.org", "wikipedia.org", "cia.gov", "state.gov"],
+    "P463": ["un.org", "wto.org", "who.int", "unesco.org", "oecd.org"],
+    "P276": ["geonames.org", "openstreetmap.org", "archinform.net", "structurae.net"],
+    "P155": ["wikidata.org", "wikipedia.org", "britannica.com", "archive.org"],
+    "P156": ["wikidata.org", "wikipedia.org", "britannica.com", "archive.org"],
+    "P1376": ["wikidata.org", "wikipedia.org", "britannica.com", "wikisource.org"],
+    "P18": ["commons.wikimedia.org", "flickr.com", "inaturalist.org", "gbif.org"],
+    "P227": ["viaf.org", "worldcat.org", "id.loc.gov", "isni.org", "d-nb.info", "bnf.fr"],
+    "P213": ["viaf.org", "worldcat.org", "id.loc.gov", "isni.org"],
+    "P214": ["viaf.org", "worldcat.org", "id.loc.gov", "isni.org", "orcid.org"],
+    "P646": ["viaf.org", "worldcat.org", "id.loc.gov", "isni.org", "freebase.com"],
+    "P244": ["viaf.org", "worldcat.org", "id.loc.gov", "isni.org", "lcnameauthority.loc.gov"],
+    "P268": ["viaf.org", "worldcat.org", "id.loc.gov", "isni.org", "d-nb.info"],
+    "P269": ["viaf.org", "worldcat.org", "id.loc.gov", "isni.org", "bnf.fr"],
+    "P270": ["viaf.org", "worldcat.org", "id.loc.gov", "isni.org", "cinii.nijp.jp"],
+    "P271": ["viaf.org", "worldcat.org", "id.loc.gov", "isni.org", "rdawiki.org"],
+    "P281": ["geonames.org", "openstreetmap.org", "worldpostalcode.com", "postalcodes.io"],
+    "P291": ["geonames.org", "openstreetmap.org", "worldcat.org", "library.congress.gov"],
+    "P345": ["imdb.com", "tmdb.org", "rottentomatoes.com", "metacritic.com", "allmovie.com"],
+    "P356": ["doi.org", "crossref.org", "sci-hub.se", "researchgate.net"],
+    "P373": ["commons.wikimedia.org", "flickr.com", "wikimedia.org"],
+    "P396": ["geonames.org", "openstreetmap.org", "waterinfo.org", "usgs.gov"],
+    "P400": ["wikidata.org", "wikipedia.org", "britannica.com", "api.semanticscholar.org"],
+    "P460": ["wikidata.org", "wikipedia.org", "britannica.com", "wikisource.org"],
+    "P466": ["wikidata.org", "wikipedia.org", "britannica.com", "archive.org"],
+    "P486": ["youtube.com", "youtu.be", "vimeo.com", "soundcloud.com", "spotify.com"],
+    "P500": ["orcid.org", "researchgate.net", "academia.edu", "scholar.google.com"],
+    "P528": ["wikidata.org", "wikipedia.org", "britannica.com", "catalogue.bnf.fr"],
+    "P551": ["wikidata.org", "wikipedia.org", "britannica.com", "findagrave.com", "billiongraves.com"],
+    "P569": ["viaf.org", "worldcat.org", "id.loc.gov", "isni.org", "d-nb.info", "bnf.fr"],
+    "P570": ["viaf.org", "worldcat.org", "id.loc.gov", "isni.org", "findagrave.com", "legacy.com"],
+    "P577": ["doi.org", "crossref.org", "arxiv.org", "semanticscholar.org", "pubmed.ncbi.nlm.nih.gov"],
+    "P607": ["geonames.org", "openstreetmap.org", "geonames.usgs.gov", "naturalearthdata.com"],
+    "P610": ["wikidata.org", "wikipedia.org", "britannica.com", "archive.org"],
+    "P629": ["wikidata.org", "wikipedia.org", "britannica.com", "wikisource.org"],
+    "P637": ["wikidata.org", "wikipedia.org", "britannica.com", "archive.org"],
+    "P641": ["olympedia.org", "sports-reference.com", "fifa.com", "uefa.com", "ioc.org", "worldathletics.org"],
+    "P646": ["freebase.com", "wikidata.org", "wikipedia.org"],
+    "P735": ["viaf.org", "worldcat.org", "id.loc.gov", "isni.org", "forebears.io"],
+    "P736": ["viaf.org", "worldcat.org", "id.loc.gov", "isni.org", "forebears.io"],
+    "P742": ["musicbrainz.org", "discogs.com", "last.fm", "spotify.com", "allmusic.com"],
+    "P767": ["musicbrainz.org", "discogs.com", "last.fm", "spotify.com", "allmusic.com"],
+    "P800": ["wikidata.org", "wikipedia.org", "britannica.com", "everything.explained.today"],
+    "P856": ["wikidata.org", "wikipedia.org", "official", "homepage"],
+    "P854": [],  # reference URL itself
+    "P856": [],  # official website
+    "P884": ["archive.org", "web.archive.org", "archive.is", "archive.today"],
+    "P910": ["wikidata.org", "wikipedia.org", "britannica.com", "wikisource.org"],
+    "P921": ["wikidata.org", "wikipedia.org", "britannica.com", "wikisource.org"],
+    "P935": ["wikidata.org", "wikipedia.org", "britannica.com", "wikisource.org"],
+    "P973": ["wikidata.org", "wikipedia.org", "britannica.com", "everything.explained.today"],
+    "P1082": ["census.gov", "worldbank.org", "citypopulation.de", "stat.gov.pl", "inegi.org.mx", "ibge.gov.br"],
+    "P1104": ["wikidata.org", "wikipedia.org", "britannica.com", "geonames.org"],
+    "P1182": ["wikidata.org", "wikipedia.org", "britannica.com", "geonames.org"],
+    "P1198": ["wikidata.org", "wikipedia.org", "britannica.com", "geonames.org"],
+    "P1324": ["wikidata.org", "wikipedia.org", "britannica.com", "archivesportaleurope.net"],
+    "P1366": ["wikidata.org", "wikipedia.org", "britannica.com", "wikisource.org"],
+    "P1411": ["wikidata.org", "wikipedia.org", "britannica.com", "wikisource.org"],
+    "P1448": ["wikidata.org", "wikipedia.org", "britannica.com", "wikisource.org"],
+    "P1476": ["doi.org", "crossref.org", "scholar.google.com", "semanticscholar.org", "pubmed.ncbi.nlm.nih.gov"],
+    "P1545": ["wikidata.org", "wikipedia.org", "britannica.com", "geonames.org"],
+    "P1559": ["wikidata.org", "wikipedia.org", "britannica.com", "wikisource.org"],
+    "P1566": ["geonames.org", "openstreetmap.org", "geonames.usgs.gov", "naturalearthdata.com"],
+    "P1619": ["wikidata.org", "wikipedia.org", "britannica.com", "geonames.org"],
+    "P1705": ["wikidata.org", "wikipedia.org", "britannica.com", "geonames.org"],
+    "P1813": ["wikidata.org", "wikipedia.org", "britannica.com", "wikisource.org"],
+    "P1889": ["doi.org", "crossref.org", "arxiv.org", "semanticscholar.org", "pubmed.ncbi.nlm.nih.gov"],
+    "P1921": ["wikidata.org", "wikipedia.org", "britannica.com", "wikisource.org"],
+    "P2044": ["wikidata.org", "wikipedia.org", "britannica.com", "geonames.org"],
+    "P2046": ["wikidata.org", "wikipedia.org", "britannica.com", "geonames.org"],
+    "P2048": ["wikidata.org", "wikipedia.org", "britannica.com", "geonames.org"],
+    "P2049": ["wikidata.org", "wikipedia.org", "britannica.com", "geonames.org"],
+    "P2130": ["wikidata.org", "wikipedia.org", "britannica.com", "geonames.org"],
+    "P2250": ["wikidata.org", "wikipedia.org", "britannica.com", "wikisource.org"],
+    "P2393": ["doi.org", "crossref.org", "pmc.ncbi.nlm.nih.gov", "pubmed.ncbi.nlm.nih.gov"],
+    "P2410": ["wikidata.org", "wikipedia.org", "britannica.com", "wikisource.org"],
+    "P2537": ["wikidata.org", "wikipedia.org", "britannica.com", "geonames.org"],
+    "P2538": ["wikidata.org", "wikipedia.org", "britannica.com", "geonames.org"],
+    "P2539": ["wikidata.org", "wikipedia.org", "britannica.com", "geonames.org"],
+    "P2540": ["wikidata.org", "wikipedia.org", "britannica.com", "geonames.org"],
+    "P2541": ["wikidata.org", "wikipedia.org", "britannica.com", "geonames.org"],
+    "P2542": ["wikidata.org", "wikipedia.org", "britannica.com", "geonames.org"],
+    "P2543": ["wikidata.org", "wikipedia.org", "britannica.com", "geonames.org"],
+    "P2544": ["wikidata.org", "wikipedia.org", "britannica.com", "geonames.org"],
+    "P2545": ["wikidata.org", "wikipedia.org", "britannica.com", "geonames.org"],
+    "P2546": ["wikidata.org", "wikipedia.org", "britannica.com", "geonames.org"],
+    "P2547": ["wikidata.org", "wikipedia.org", "britannica.com", "geonames.org"],
+    "P2548": ["wikidata.org", "wikipedia.org", "britannica.com", "geonames.org"],
+    "P2549": ["wikidata.org", "wikipedia.org", "britannica.com", "geonames.org"],
+    "P2550": ["wikidata.org", "wikipedia.org", "britannica.com", "geonames.org"],
+    "P2551": ["wikidata.org", "wikipedia.org", "britannica.com", "geonames.org"],
+    "P2552": ["wikidata.org", "wikipedia.org", "britannica.com", "geonames.org"],
+    "P2553": ["wikidata.org", "wikipedia.org", "britannica.com", "geonames.org"],
+    "P2554": ["wikidata.org", "wikipedia.org", "britannica.com", "geonames.org"],
+    "P2555": ["wikidata.org", "wikipedia.org", "britannica.com", "geonames.org"],
+    "P2556": ["wikidata.org", "wikipedia.org", "britannica.com", "geonames.org"],
+    "P2557": ["wikidata.org", "wikipedia.org", "britannica.com", "geonames.org"],
+    "P2558": ["wikidata.org", "wikipedia.org", "britannica.com", "geonames.org"],
+    "P2559": ["wikidata.org", "wikipedia.org", "britannica.com", "geonames.org"],
+    "P2560": ["wikidata.org", "wikipedia.org", "britannica.com", "geonames.org"],
+    "P2561": ["wikidata.org", "wikipedia.org", "britannica.com", "geonames.org"],
+    "P2562": ["wikidata.org", "wikipedia.org", "britannica.com", "geonames.org"],
+    "P2563": ["wikidata.org", "wikipedia.org", "britannica.com", "geonames.org"],
+    "P2564": ["wikidata.org", "wikipedia.org", "britannica.com", "geonames.org"],
+    "P2565": ["wikidata.org", "wikipedia.org", "britannica.com", "geonames.org"],
+    "P2566": ["wikidata.org", "wikipedia.org", "britannica.com", "geonames.org"],
+    "P2567": ["wikidata.org", "wikipedia.org", "britannica.com", "geonames.org"],
+    "P2568": ["wikidata.org", "wikipedia.org", "britannica.com", "geonames.org"],
+    "P2569": ["wikidata.org", "wikipedia.org", "britannica.com", "geonames.org"],
+    "P2570": ["wikidata.org", "wikipedia.org", "britannica.com", "geonames.org"],
+    "P2571": ["wikidata.org", "wikipedia.org", "britannica.com", "geonames.org"],
+    "P2572": ["wikidata.org", "wikipedia.org", "britannica.com", "geonames.org"],
+    "P2573": ["wikidata.org", "wikipedia.org", "britannica.com", "geonames.org"],
+    "P2574": ["wikidata.org", "wikipedia.org", "britannica.com", "geonames.org"],
+    "P2575": ["wikidata.org", "wikipedia.org", "britannica.com", "geonames.org"],
+    "P2576": ["wikidata.org", "wikipedia.org", "britannica.com", "geonames.org"],
+    "P2577": ["wikidata.org", "wikipedia.org", "britannica.com", "geonames.org"],
+    "P2578": ["wikidata.org", "wikipedia.org", "britannica.com", "geonames.org"],
+    "P2579": ["wikidata.org", "wikipedia.org", "britannica.com", "geonames.org"],
+    "P2580": ["wikidata.org", "wikipedia.org", "britannica.com", "geonames.org"],
+    "P2581": ["wikidata.org", "wikipedia.org", "britannica.com", "geonames.org"],
+    "P2582": ["wikidata.org", "wikipedia.org", "britannica.com", "geonames.org"],
+    "P2583": ["wikidata.org", "wikipedia.org", "britannica.com", "geonames.org"],
+    "P2584": ["wikidata.org", "wikipedia.org", "britannica.com", "geonames.org"],
+    "P2585": ["wikidata.org", "wikipedia.org", "britannica.com", "geonames.org"],
+    "P2586": ["wikidata.org", "wikipedia.org", "britannica.com", "geonames.org"],
+    "P2587": ["wikidata.org", "wikipedia.org", "britannica.com", "geonames.org"],
+    "P2588": ["wikidata.org", "wikipedia.org", "britannica.com", "geonames.org"],
+    "P2589": ["wikidata.org", "wikipedia.org", "britannica.com", "geonames.org"],
+    "P2590": ["wikidata.org", "wikipedia.org", "britannica.com", "geonames.org"],
+    "P2591": ["wikidata.org", "wikipedia.org", "britannica.com", "geonames.org"],
+    "P2592": ["wikidata.org", "wikipedia.org", "britannica.com", "geonames.org"],
+    "P2593": ["wikidata.org", "wikipedia.org", "britannica.com", "geonames.org"],
+    "P2594": ["wikidata.org", "wikipedia.org", "britannica.com", "geonames.org"],
+    "P2595": ["wikidata.org", "wikipedia.org", "britannica.com", "geonames.org"],
+    "P2596": ["wikidata.org", "wikipedia.org", "britannica.com", "geonames.org"],
+    "P2597": ["wikidata.org", "wikipedia.org", "britannica.com", "geonames.org"],
+    "P2598": ["wikidata.org", "wikipedia.org", "britannica.com", "geonames.org"],
+    "P2599": ["wikidata.org", "wikipedia.org", "britannica.com", "geonames.org"],
+    "P2600": ["wikidata.org", "wikipedia.org", "britannica.com", "geonames.org"],
+}
+
+
+async def search_domain(session, semaphore, domain, query, max_results=5):
+    """Search a specific domain using site: query via search API or direct fetch."""
+    # For now, construct a search URL and fetch results
+    # In production, use SerpAPI/Bing/Google CSE
+    search_url = f"https://www.google.com/search?q=site:{domain}+{quote(query)}&num={max_results}"
+    # This is a placeholder - real implementation would use a search API
+    return []
+
+
+async def find_candidates_from_domains(session, semaphore, claim_ctx, max_results=10):
+    """Find candidate URLs from curated authority domains."""
+    property_id = claim_ctx.get("property_id", "")
+    domains = PROPERTY_AUTHORITY_DOMAINS.get(property_id, PROPERTY_AUTHORITY_DOMAINS.get("default", ["wikidata.org", "wikipedia.org", "britannica.com"]))
+    
+    # Build search queries
+    item_label = claim_ctx.get("item_label", "")
+    prop_label = claim_ctx.get("property_label", "")
+    value_label = claim_ctx.get("statement_value_label", "")
+    
+    queries = []
+    if item_label and prop_label:
+        queries.append(f'"{item_label}" "{prop_label}"')
+    if value_label and prop_label:
+        queries.append(f'"{value_label}" "{prop_label}"')
+    if item_label and value_label:
+        queries.append(f'{item_label} {prop_label} {value_label}')
+    
+    # For now, return empty - would need search API integration
+    # This is the structure for when search API is available
+    return []
+
+
+async def find_candidates_from_wikidata_sparql(session, claim_ctx, max_results=10):
+    """Find references from similar items via Wikidata SPARQL."""
+    property_id = claim_ctx.get("property_id", "")
+    statement_value = claim_ctx.get("statement_value", "")
+    
+    if not property_id or not statement_value:
+        return []
+    
+    # SPARQL to find items with same property-value that have live references
+    sparql_query = f"""
+    SELECT DISTINCT ?item ?itemLabel ?refUrl ?refTitle WHERE {{
+      ?item wdt:{property_id} wd:{statement_value} .
+      ?item p:{property_id} ?stmt .
+      ?stmt ps:{property_id} wd:{statement_value} .
+      ?stmt prov:wasDerivedFrom ?ref .
+      ?ref wdt:P854 ?refUrl .
+      OPTIONAL {{ ?ref wdt:P1476 ?refTitle . }}
+      OPTIONAL {{ ?item rdfs:label ?itemLabel . FILTER(LANG(?itemLabel) = "en") }}
+      FILTER(STRSTARTS(STR(?refUrl), "http"))
+    }}
+    LIMIT {max_results * 3}
+    """
+    
+    try:
+        params = {"query": sparql_query, "format": "json"}
+        async with session.get(WIKIDATA_SPARQL, params=params, headers=EXTERNAL_HEADERS, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+            if resp.status != 200:
+                return []
+            data = await resp.json()
+            results = data.get("results", {}).get("bindings", [])
+            
+            candidates = []
+            for r in results:
+                url = r.get("refUrl", {}).get("value", "")
+                title = r.get("refTitle", {}).get("value", "")
+                item_label = r.get("itemLabel", {}).get("value", "")
+                if url:
+                    candidates.append({
+                        "url": url,
+                        "title": title,
+                        "source_item": item_label,
+                        "source": "wikidata_sparql",
+                        "property_id": property_id,
+                        "statement_value": statement_value
+                    })
+            return candidates[:max_results]
+    except Exception as e:
+        print(f"[SPARQL] Failed: {e}")
+        return []
+
+
+async def fetch_and_verify_candidate(session, semaphore, url, claim_ctx):
+    """Fetch a candidate URL and verify it contains the claim information."""
+    async with semaphore:
+        try:
+            timeout = aiohttp.ClientTimeout(total=10)
+            async with session.get(url, headers=EXTERNAL_HEADERS, timeout=timeout, allow_redirects=True) as resp:
+                if resp.status != 200:
+                    return None
+                html = await resp.text()
+                
+                # Extract text content
+                text = extract_text_from_html(html)
+                if not text or len(text) < 100:
+                    return None
+                
+                # Score relevance
+                score = score_candidate_relevance(text, claim_ctx)
+                if score < 0.3:
+                    return None
+                
+                # Find best text fragment for deep linking
+                fragment = find_best_fragment(text, claim_ctx)
+                
+                domain, category = categorize_source(url)
+                
+                return {
+                    "url": url,
+                    "score": score,
+                    "snippet": highlight_snippet(text, claim_ctx, fragment),
+                    "deep_link": f"{url}#:~:text={fragment}" if fragment else url,
+                    "source_category": category,
+                    "domain": domain,
+                    "fetched_at": int(time.time())
+                }
+        except Exception as e:
+            print(f"[Verify] Failed for {url}: {e}")
+            return None
+
+
+def extract_text_from_html(html):
+    """Extract main text content from HTML."""
+    try:
+        # Simple extraction - in production use trafilatura or readability-lxml
+        import re
+        # Remove scripts, styles
+        html = re.sub(r'<script[^>]*>.*?</script>', '', html, flags=re.DOTALL | re.IGNORECASE)
+        html = re.sub(r'<style[^>]*>.*?</style>', '', html, flags=re.DOTALL | re.IGNORECASE)
+        # Get text
+        text = re.sub(r'<[^>]+>', ' ', html)
+        text = re.sub(r'\s+', ' ', text)
+        return text.strip()[:10000]  # Limit size
+    except Exception:
+        return ""
+
+
+def score_candidate_relevance(text, claim_ctx):
+    """Score how well a page matches the claim."""
+    import re
+    text_lower = text.lower()
+    
+    item_label = claim_ctx.get("item_label", "").lower()
+    prop_label = claim_ctx.get("property_label", "").lower()
+    value_label = claim_ctx.get("statement_value_label", "").lower()
+    
+    score = 0.0
+    weights = {"item": 0.4, "property": 0.3, "value": 0.3}
+    
+    if item_label and item_label in text_lower:
+        score += weights["item"]
+    if prop_label and prop_label in text_lower:
+        score += weights["property"]
+    if value_label and value_label in text_lower:
+        score += weights["value"]
+    
+    # Bonus for proximity
+    if item_label and value_label:
+        item_pos = text_lower.find(item_label)
+        value_pos = text_lower.find(value_label)
+        if item_pos >= 0 and value_pos >= 0:
+            distance = abs(item_pos - value_pos)
+            if distance < 200:
+                score += 0.1
+            elif distance < 500:
+                score += 0.05
+    
+    return min(score, 1.0)
+
+
+def find_best_fragment(text, claim_ctx):
+    """Find the best text fragment for deep linking."""
+    import re
+    text_lower = text.lower()
+    
+    item_label = claim_ctx.get("item_label", "").lower()
+    value_label = claim_ctx.get("statement_value_label", "").lower()
+    
+    # Find position of key terms
+    positions = []
+    if item_label:
+        pos = text_lower.find(item_label)
+        if pos >= 0:
+            positions.append(pos)
+    if value_label:
+        pos = text_lower.find(value_label)
+        if pos >= 0:
+            positions.append(pos)
+    
+    if not positions:
+        return ""
+    
+    # Center fragment around middle of matches
+    center = sum(positions) // len(positions)
+    start = max(0, center - 150)
+    end = min(len(text), center + 150)
+    fragment = text[start:end].strip()
+    
+    # Clean for URL fragment
+    fragment = re.sub(r'\s+', ' ', fragment)
+    fragment = fragment[:300]  # URL fragment limit
+    return fragment
+
+
+def highlight_snippet(text, claim_ctx, fragment):
+    """Create highlighted snippet for display."""
+    # Simple highlighting - wrap key terms in <mark>
+    import re
+    snippet = fragment if fragment else text[:300]
+    
+    for term in [claim_ctx.get("item_label", ""), claim_ctx.get("statement_value_label", ""), claim_ctx.get("property_label", "")]:
+        if term:
+            snippet = re.sub(f'(?i)({re.escape(term)})', r'<mark>\1</mark>', snippet)
+    
+    return snippet
+
+
+# ---------------------------------------------------
 # LABEL & STATEMENT VALUE HELPERS
 # ---------------------------------------------------
 
@@ -743,6 +1126,334 @@ def validate_references():
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+
+# ---------------------------------------------------
+# REFERENCE REPLACEMENT API
+# ---------------------------------------------------
+
+@app.route("/api/candidates", methods=["POST"])
+def find_replacement_candidates():
+    """Find replacement candidates for a dead reference."""
+    data = request.get_json(silent=True) or {}
+    
+    qid = (data.get("qid") or "").strip().upper()
+    property_id = (data.get("property_id") or "").strip().upper()
+    statement_hash = (data.get("statement_hash") or "").strip()
+    dead_url = (data.get("dead_url") or "").strip()
+    
+    if not qid or not property_id:
+        return jsonify({"error": "Missing qid or property_id"}), 400
+    
+    try:
+        # Get the item and claim details
+        params = {
+            "action": "wbgetentities",
+            "ids": qid,
+            "format": "json"
+        }
+        r = requests.get(WIKIDATA_API, params=params, headers=WIKIDATA_HEADERS, timeout=15)
+        r.raise_for_status()
+        
+        entity = r.json().get("entities", {}).get(qid, {})
+        if not entity or "missing" in entity:
+            return jsonify({"error": f"Wikidata item '{qid}' not found"}), 404
+        
+        item_label = pick_label(entity.get("labels"), qid, DEFAULT_LANGUAGE)
+        claims = entity.get("claims", {}).get(property_id, [])
+        
+        # Find the specific claim
+        target_claim = None
+        statement_value = ""
+        statement_value_label = ""
+        
+        for claim in claims:
+            claim_hash = hashlib.sha256(json.dumps(claim, sort_keys=True).encode()).hexdigest()[:16]
+            if claim_hash == statement_hash or not statement_hash:
+                target_claim = claim
+                mainsnak = claim.get("mainsnak", {})
+                datavalue = mainsnak.get("datavalue", {})
+                val = datavalue.get("value")
+                if isinstance(val, dict) and "id" in val:
+                    statement_value = val["id"]
+                    # Fetch label for the value
+                    value_labels = fetch_labels({statement_value}, DEFAULT_LANGUAGE)
+                    statement_value_label = value_labels.get(statement_value, statement_value)
+                else:
+                    statement_value = str(val)
+                    statement_value_label = str(val)
+                break
+        
+        if not target_claim:
+            return jsonify({"error": "Claim not found"}), 404
+        
+        # Build claim context
+        claim_ctx = {
+            "qid": qid,
+            "item_label": item_label,
+            "property_id": property_id,
+            "property_label": pick_label(
+                requests.get(WIKIDATA_API, params={"action": "wbgetentities", "ids": property_id, "format": "json", "props": "labels", "languages": "en"}).json().get("entities", {}).get(property_id, {}).get("labels", {}),
+                property_id, DEFAULT_LANGUAGE
+            ),
+            "statement_value": statement_value,
+            "statement_value_label": statement_value_label,
+            "dead_url": dead_url
+        }
+        
+        # Run async candidate discovery
+        async def run_discovery():
+            semaphore = asyncio.Semaphore(10)
+            connector = aiohttp.TCPConnector(ssl=False, limit=20)
+            async with aiohttp.ClientSession(headers=EXTERNAL_HEADERS, connector=connector) as session:
+                # Get candidates from Wikidata SPARQL (proven references)
+                sparql_candidates = await find_candidates_from_wikidata_sparql(session, claim_ctx, max_results=10)
+                
+                # Verify each candidate
+                verified = []
+                for cand in sparql_candidates:
+                    result = await fetch_and_verify_candidate(session, semaphore, cand["url"], claim_ctx)
+                    if result:
+                        result["title"] = cand.get("title", "")
+                        result["source"] = "wikidata_sparql"
+                        verified.append(result)
+                
+                # Sort by score
+                verified.sort(key=lambda x: x["score"], reverse=True)
+                return verified[:10]
+        
+        candidates = asyncio.run(run_discovery())
+        
+        return jsonify({
+            "candidates": candidates,
+            "claim": {
+                "qid": qid,
+                "property_id": property_id,
+                "property_label": claim_ctx["property_label"],
+                "statement_value": statement_value,
+                "statement_value_label": statement_value_label,
+                "dead_url": dead_url
+            }
+        })
+        
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+# ---------------------------------------------------
+# USER API
+# ---------------------------------------------------
+
+@app.route("/api/user")
+def api_user():
+    """Return current user info."""
+    user = session.get("user")
+    if user:
+        return jsonify(user)
+    return jsonify(None), 401
+
+
+# ---------------------------------------------------
+# REFERENCE REPLACEMENT EDIT API
+# ---------------------------------------------------
+
+@app.route("/api/replace-reference", methods=["POST"])
+def replace_reference():
+    """Add a new reference to a Wikidata statement via OAuth."""
+    if "user" not in session:
+        return jsonify({"error": "Authentication required"}), 401
+    
+    data = request.get_json(silent=True) or {}
+    
+    qid = (data.get("qid") or "").strip().upper()
+    property_id = (data.get("property_id") or "").strip().upper()
+    statement_hash = (data.get("statement_hash") or "").strip()
+    new_url = (data.get("new_url") or "").strip()
+    dead_url = (data.get("dead_url") or "").strip()
+    
+    if not qid or not property_id or not new_url:
+        return jsonify({"error": "Missing required fields"}), 400
+    
+    # Get OAuth token from session (would need to be stored during login)
+    access_token = session.get("oauth_token")
+    if not access_token:
+        return jsonify({"error": "OAuth token not found. Please re-login."}), 401
+    
+    try:
+        # Get the item and find the specific claim
+        params = {
+            "action": "wbgetentities",
+            "ids": qid,
+            "format": "json"
+        }
+        r = requests.get(WIKIDATA_API, params=params, headers=WIKIDATA_HEADERS, timeout=15)
+        r.raise_for_status()
+        
+        entity = r.json().get("entities", {}).get(qid, {})
+        if not entity or "missing" in entity:
+            return jsonify({"error": f"Wikidata item '{qid}' not found"}), 404
+        
+        claims = entity.get("claims", {}).get(property_id, [])
+        if not claims:
+            return jsonify({"error": f"No claims found for property {property_id}"}), 404
+        
+        # Find the claim matching the statement hash
+        target_claim = None
+        for claim in claims:
+            claim_hash = hashlib.sha256(json.dumps(claim, sort_keys=True).encode()).hexdigest()[:16]
+            if claim_hash == statement_hash or not statement_hash:
+                target_claim = claim
+                break
+        
+        if not target_claim:
+            return jsonify({"error": "Claim not found"}), 404
+        
+        claim_id = target_claim.get("id")
+        if not claim_id:
+            return jsonify({"error": "Claim ID not found"}), 500
+        
+        # Get CSRF token
+        csrf_params = {
+            "action": "query",
+            "meta": "tokens",
+            "type": "csrf",
+            "format": "json"
+        }
+        csrf_r = requests.get(WIKIDATA_API, params=csrf_params, headers={**WIKIDATA_HEADERS, "Authorization": f"Bearer {access_token}"}, timeout=15)
+        csrf_r.raise_for_status()
+        csrf_token = csrf_r.json().get("query", {}).get("tokens", {}).get("csrftoken")
+        
+        if not csrf_token:
+            return jsonify({"error": "Failed to get CSRF token"}), 500
+        
+        # Build reference snaks
+        ref_snaks = {
+            "P248": [{"snaktype": "value", "datavalue": {"type": "wikibase-entityid", "value": {"id": "Q1104466"}}}],  # stated in: CIA World Factbook (placeholder)
+            "P854": [{"snaktype": "value", "datavalue": {"type": "string", "value": new_url}}],  # reference URL
+            "P813": [{"snaktype": "value", "datavalue": {"type": "time", "value": {
+                "time": datetime.utcnow().strftime("+%Y-%m-%dT%H:%M:%SZ"),
+                "timezone": 0,
+                "before": 0,
+                "after": 0,
+                "precision": 11,
+                "calendarmodel": "http://www.wikidata.org/entity/Q1985727"
+            }}}]  # retrieved date
+        }
+        
+        # Try to determine stated-in (P248) from the new URL domain
+        stated_in_qid = get_stated_in_qid(new_url)
+        if stated_in_qid:
+            ref_snaks["P248"] = [{"snaktype": "value", "datavalue": {"type": "wikibase-entityid", "value": {"id": stated_in_qid}}}]
+        
+        # Add reference via wbsetreference
+        edit_params = {
+            "action": "wbsetreference",
+            "statement": claim_id,
+            "snaks": json.dumps(ref_snaks),
+            "token": csrf_token,
+            "format": "json"
+        }
+        
+        edit_r = requests.post(WIKIDATA_API, data=edit_params, headers={**WIKIDATA_HEADERS, "Authorization": f"Bearer {access_token}"}, timeout=30)
+        edit_r.raise_for_status()
+        edit_result = edit_r.json()
+        
+        if edit_result.get("success") != 1:
+            return jsonify({"error": f"Wikidata edit failed: {edit_result}"}), 500
+        
+        # Log the replacement
+        app.logger.info(
+            "Reference replaced",
+            extra={
+                "qid": qid,
+                "property": property_id,
+                "claim_id": claim_id,
+                "old_url": dead_url,
+                "new_url": new_url,
+                "user": session["user"]["username"]
+            }
+        )
+        
+        return jsonify({
+            "success": True,
+            "claim_id": claim_id,
+            "reference_hash": edit_result.get("reference", {}).get("hash"),
+            "message": "Reference added successfully"
+        })
+        
+    except Exception as e:
+        app.logger.error(f"Reference replacement failed: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+def get_stated_in_qid(url):
+    """Map a URL domain to a Wikidata QID for 'stated in' (P248)."""
+    try:
+        host = (urlparse(url).hostname or "").lower()
+    except ValueError:
+        return None
+    
+    if host.startswith("www."):
+        host = host[4:]
+    
+    # Common domain -> QID mappings for P248
+    domain_to_qid = {
+        "cia.gov": "Q1104466",           # CIA World Factbook
+        "state.gov": "Q1104466",         # US State Department
+        "un.org": "Q1059382",            # United Nations
+        "wikidata.org": "Q2013",         # Wikidata
+        "wikipedia.org": "Q52",          # Wikipedia
+        "britannica.com": "Q5375741",    # Encyclopaedia Britannica
+        "geonames.org": "Q584703",       # GeoNames
+        "openstreetmap.org": "Q936",     # OpenStreetMap
+        "viaf.org": "Q54919",            # VIAF
+        "worldcat.org": "Q41513",        # WorldCat
+        "id.loc.gov": "Q1063627",        # Library of Congress
+        "isni.org": "Q414906",           # ISNI
+        "orcid.org": "Q49608",           # ORCID
+        "doi.org": "Q25679",             # DOI
+        "crossref.org": "Q25679",        # Crossref
+        "arxiv.org": "Q1183634",         # arXiv
+        "pubmed.ncbi.nlm.nih.gov": "Q544340",  # PubMed
+        "census.gov": "Q1059424",        # US Census Bureau
+        "worldbank.org": "Q1059424",     # World Bank
+        "citypopulation.de": "Q5177871", # CityPopulation
+        "commons.wikimedia.org": "Q565", # Wikimedia Commons
+        "flickr.com": "Q103204",         # Flickr
+        "imdb.com": "Q37312",            # IMDb
+        "musicbrainz.org": "Q14005",     # MusicBrainz
+        "discogs.com": "Q504063",        # Discogs
+        "github.com": "Q364",            # GitHub
+        "loc.gov": "Q1063627",           # Library of Congress
+        "archive.org": "Q45196",         # Internet Archive
+        "nominatim.openstreetmap.org": "Q936",  # Nominatim
+        "geodata.solutions": "Q1104466", # placeholder
+        "stat.gov.pl": "Q1059424",       # Statistics Poland
+        "inegi.org.mx": "Q1059424",      # INEGI
+        "ibge.gov.br": "Q1059424",       # IBGE
+        "d-nb.info": "Q1059424",         # German National Library
+        "bnf.fr": "Q1059424",            # Bibliothèque nationale de France
+        "catalogue.bnf.fr": "Q1059424",  # BnF Catalogue
+        "nla.gov.au": "Q1059424",        # National Library of Australia
+        "trove.nla.gov.au": "Q1059424",  # Trove
+        "allmusic.com": "Q1059424",      # AllMusic
+        "rottentomatoes.com": "Q1059424",# Rotten Tomatoes
+        "themoviedb.org": "Q1059424",    # TMDB
+        "goodreads.com": "Q1059424",     # Goodreads
+        "librarything.com": "Q1059424",  # LibraryThing
+        "britishmuseum.org": "Q1059424", # British Museum
+        "europeana.eu": "Q1059424",      # Europeana
+        "getty.edu": "Q1059424",         # Getty
+        "unesco.org": "Q1059424",        # UNESCO
+        "olympedia.org": "Q1059424",     # Olympedia
+        "sports-reference.com": "Q1059424", # Sports Reference
+        "transfermarkt.com": "Q1059424", # Transfermarkt
+        "fifa.com": "Q1059424",          # FIFA
+        "census.gov": "Q1059424",        # Census.gov
+        "citypopulation.de": "Q1059424", # CityPopulation
+    }
+    
+    return domain_to_qid.get(host)
 
 
 # ---------------------------------------------------

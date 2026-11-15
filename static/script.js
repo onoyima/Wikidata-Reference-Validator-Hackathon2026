@@ -580,11 +580,12 @@ function renderReference(ref) {
   const meta = sourceCategoryMeta(ref.sourceCategory);
   const statusLabel = isDead ? "Unreachable" : ref.status === "alive" ? "Alive" : ref.status;
   const http = ref.httpStatus ? `HTTP ${ref.httpStatus}` : isDead ? "No response" : "";
+  const error = ref.error ? `${ref.httpStatus ? " - " : ""}${ref.error}` : "";
   const archive = ref.suggestedArchive;
 
   return `
     <li class="ref ${isDead ? "ref--dead" : "ref--alive"}" data-ref="${state.report.references.indexOf(ref)}">
-      <span class="ref__status" title="${escapeHtml(statusLabel)}${http ? ` (${escapeHtml(http)})` : ""}">
+      <span class="ref__status" title="${escapeHtml(statusLabel)}${http ? ` (${escapeHtml(http)})` : ""}${error ? ` - ${escapeHtml(error)}` : ""}">
         <i class="bi ${isDead ? "bi-x-circle-fill" : "bi-check-circle-fill"}" aria-hidden="true"></i>
         <span class="visually-hidden">${escapeHtml(statusLabel)}</span>
       </span>
@@ -596,6 +597,7 @@ function renderReference(ref) {
           <span class="tag"><i class="bi ${meta.icon}"></i> ${meta.label}</span>
           ${ref.statementValue ? `<span class="ref__value" title="Statement value">${escapeHtml(ref.statementValue)}</span>` : ""}
           ${http ? `<span class="ref__http ${isDead ? "text-dead" : ""}">${escapeHtml(http)}</span>` : ""}
+          ${error ? `<span class="ref__error text-dead">${escapeHtml(error)}</span>` : ""}
         </div>
 
         ${isDead ? `
@@ -610,6 +612,14 @@ function renderReference(ref) {
               <span>No snapshot found automatically.</span>
               <a href="https://web.archive.org/web/*/${escapeHtml(encodeURI(ref.url))}" target="_blank" rel="noopener noreferrer">Search the Wayback Machine</a>
             `}
+          </div>
+          <div class="ref__replacement mt-2">
+            <button type="button" class="btn-ghost btn-sm" data-action="find-replacement"
+                    data-qid="${qid}" data-property="${ref.propertyId}"
+                    data-dead-url="${escapeHtml(ref.url)}"
+                    title="Find replacement references from authoritative sources">
+              <i class="bi bi-search"></i> Find Replacement
+            </button>
           </div>` : ""}
       </div>
 
@@ -753,8 +763,249 @@ els.result.addEventListener("click", e => {
       setFilter("status", "all");
       break;
     }
+    case "find-replacement":
+      openReplacementModal(target);
+      break;
   }
 });
+
+/**************************************
+ * MODAL ACTIONS (document-level for dynamic modals)
+ **************************************/
+document.addEventListener("click", e => {
+  const target = e.target.closest("button[data-action='confirm-replacement']");
+  if (!target) return;
+  
+  confirmReplacement(target);
+});
+
+
+async function confirmReplacement(button) {
+  const qid = button.dataset.qid;
+  const propertyId = button.dataset.property;
+  const newUrl = button.dataset.newUrl;
+  const deadUrl = button.dataset.deadUrl;
+  const modal = document.getElementById("replacementModal");
+  const statementHash = modal?.dataset.statementHash || "";
+  
+  if (!qid || !propertyId || !newUrl) {
+    toast("Missing required data for replacement");
+    return;
+  }
+  
+  // Check OAuth login
+  const user = await fetch("/api/user").then(r => r.json()).catch(() => null);
+  if (!user?.username) {
+    toast("Please log in with Wikimedia to edit references");
+    return;
+  }
+  
+  button.disabled = true;
+  button.innerHTML = '<span class="spinner-border spinner-border-sm"></span> Updating...';
+  
+  try {
+    const response = await fetch("/api/replace-reference", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        qid,
+        property_id: propertyId,
+        statement_hash: statementHash,
+        new_url: newUrl,
+        dead_url: deadUrl
+      })
+    });
+    
+    const data = await response.json();
+    
+    if (data.error) {
+      throw new Error(data.error);
+    }
+    
+    toast("Reference updated successfully!");
+    const bsModal = bootstrap.Modal.getInstance(modal);
+    bsModal?.hide();
+    
+    // Refresh the validation
+    validate(qid, state.report.label);
+    
+  } catch (err) {
+    toast("Failed to update reference: " + err.message);
+  } finally {
+    button.disabled = false;
+    button.innerHTML = '<i class="bi bi-check-circle"></i> Use This';
+  }
+}
+
+
+/**************************************
+ * REPLACEMENT CANDIDATE MODAL
+ **************************************/
+function openReplacementModal(button) {
+  const qid = button.dataset.qid;
+  const propertyId = button.dataset.property;
+  const deadUrl = button.dataset.deadUrl;
+  
+  // Find the statement hash
+  const refIndex = parseInt(button.closest("[data-ref]")?.dataset.ref || "-1");
+  let statementHash = "";
+  if (refIndex >= 0 && state.report && state.report.references[refIndex]) {
+    const ref = state.report.references[refIndex];
+    // Generate hash from claim data
+    statementHash = hashCode(`${qid}-${propertyId}-${ref.statementValue}`);
+  }
+  
+  // Create modal
+  const modalId = "replacementModal";
+  let modal = document.getElementById(modalId);
+  if (!modal) {
+    modal = document.createElement("div");
+    modal.id = modalId;
+    modal.className = "modal fade";
+    modal.setAttribute("tabindex", "-1");
+    modal.setAttribute("aria-labelledby", "replacementModalLabel");
+    modal.setAttribute("aria-hidden", "true");
+    modal.innerHTML = `
+      <div class="modal-dialog modal-lg modal-dialog-scrollable">
+        <div class="modal-content">
+          <div class="modal-header">
+            <h5 class="modal-title" id="replacementModalLabel"><i class="bi bi-search"></i> Find Replacement References</h5>
+            <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+          </div>
+          <div class="modal-body">
+            <div id="replacementLoading" class="text-center py-4">
+              <div class="spinner-border" role="status"><span class="visually-hidden">Searching...</span></div>
+              <p class="mt-2">Searching authoritative sources...</p>
+            </div>
+            <div id="replacementResults" class="d-none">
+              <div class="mb-3">
+                <label class="form-label"><strong>Claim:</strong> <span id="replacementClaim"></span></label>
+                <div class="text-muted small">Dead URL: <a id="replacementDeadUrl" href="#" target="_blank" class="text-break"></a></div>
+              </div>
+              <div id="replacementCandidates" class="list-group"></div>
+            </div>
+            <div id="replacementError" class="alert alert-danger d-none"></div>
+          </div>
+          <div class="modal-footer">
+            <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button>
+          </div>
+        </div>
+      </div>`;
+    document.body.appendChild(modal);
+  }
+  
+  const bsModal = new bootstrap.Modal(modal);
+  bsModal.show();
+  
+  // Reset modal content
+  document.getElementById("replacementLoading").classList.remove("d-none");
+  document.getElementById("replacementResults").classList.add("d-none");
+  document.getElementById("replacementError").classList.add("d-none");
+  document.getElementById("replacementCandidates").innerHTML = "";
+  
+  // Fetch candidates
+  fetch("/api/candidates", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      qid,
+      property_id: propertyId,
+      statement_hash: statementHash,
+      dead_url: deadUrl
+    })
+  })
+    .then(r => r.json())
+    .then(data => {
+      document.getElementById("replacementLoading").classList.add("d-none");
+      if (data.error) {
+        document.getElementById("replacementError").textContent = data.error;
+        document.getElementById("replacementError").classList.remove("d-none");
+        return;
+      }
+      
+      const claim = data.claim;
+      document.getElementById("replacementClaim").innerHTML = 
+        `<code>${escapeHtml(claim.property_id)}</code> ${escapeHtml(claim.property_label)}: <strong>${escapeHtml(claim.statement_value_label)}</strong>`;
+      document.getElementById("replacementDeadUrl").href = claim.dead_url;
+      document.getElementById("replacementDeadUrl").textContent = claim.dead_url;
+      
+      const candidates = data.candidates || [];
+      const container = document.getElementById("replacementCandidates");
+      
+      if (candidates.length === 0) {
+        container.innerHTML = `
+          <div class="list-group-item text-center text-muted py-4">
+            <i class="bi bi-search-x" style="font-size: 2rem;"></i>
+            <p class="mt-2">No suitable replacement candidates found.</p>
+            <p class="small">Try searching manually or check the Wayback Machine.</p>
+          </div>`;
+      } else {
+        container.innerHTML = candidates.map((cand, i) => `
+          <div class="list-group-item">
+            <div class="d-flex justify-content-between align-items-start">
+              <div class="flex-grow-1">
+                <div class="d-flex align-items-center gap-2 mb-1">
+                  <span class="badge bg-${getCategoryColor(cand.source_category)}">${escapeHtml(cand.source_category)}</span>
+                  <span class="badge bg-info text-dark">Score: ${Math.round(cand.score * 100)}%</span>
+                </div>
+                <div class="small text-muted mb-1">${escapeHtml(cand.domain)}</div>
+                <div class="snippet">${cand.snippet}</div>
+              </div>
+              <div class="ms-3 d-flex flex-column gap-1">
+                <a href="${escapeHtml(cand.deep_link)}" target="_blank" class="btn btn-sm btn-outline-primary" title="Open at relevant section">
+                  <i class="bi bi-box-arrow-up-right"></i> Verify
+                </a>
+                <button type="button" class="btn btn-sm btn-success" data-action="confirm-replacement"
+                        data-qid="${escapeHtml(qid)}" data-property="${escapeHtml(propertyId)}"
+                        data-new-url="${escapeHtml(cand.url)}" data-dead-url="${escapeHtml(deadUrl)}"
+                        title="Confirm and add this as a reference via Wikidata edit">
+                  <i class="bi bi-check-circle"></i> Use This
+                </button>
+              </div>
+            </div>
+          </div>`).join("");
+      }
+      
+      document.getElementById("replacementResults").classList.remove("d-none");
+    })
+    .catch(err => {
+      document.getElementById("replacementLoading").classList.add("d-none");
+      document.getElementById("replacementError").textContent = "Failed to fetch candidates: " + err.message;
+      document.getElementById("replacementError").classList.remove("d-none");
+    });
+  
+  // Store current claim context for confirmation
+  modal.dataset.qid = qid;
+  modal.dataset.property = propertyId;
+  modal.dataset.deadUrl = deadUrl;
+  modal.dataset.statementHash = statementHash;
+}
+
+
+function getCategoryColor(category) {
+  const colors = {
+    "reference": "primary",
+    "academic": "info",
+    "government": "success",
+    "wikimedia": "warning",
+    "archive": "secondary",
+    "news": "danger",
+    "social": "dark",
+    "other": "light"
+  };
+  return colors[category] || "secondary";
+}
+
+
+function hashCode(str) {
+  let hash = 0;
+  for (let i = 0; i < str.length; i++) {
+    const char = str.charCodeAt(i);
+    hash = ((hash << 5) - hash) + char;
+    hash = hash & hash;
+  }
+  return Math.abs(hash).toString(16).substring(0, 16);
+}
 
 async function copyText(text, message) {
   try {
